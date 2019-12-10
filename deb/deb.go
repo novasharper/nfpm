@@ -125,7 +125,11 @@ func createFilesInsideTarGz(info *nfpm.Info, out *tar.Writer, created map[string
 		info.Files,
 		info.ConfigFiles,
 	} {
-		for srcglob, dstroot := range files {
+		for srcglob, dstraw := range files {
+			dstroot, user, _ := nfpm.GetFilesAttr(dstraw)
+			if user == "" {
+				user = info.User
+			}
 			globbed, err := glob.Glob(srcglob, dstroot)
 			if err != nil {
 				return md5buf, 0, err
@@ -138,10 +142,10 @@ func createFilesInsideTarGz(info *nfpm.Info, out *tar.Writer, created map[string
 					fmt.Printf("skipping %s because it has the suffix %s", src, info.Target)
 					continue
 				}
-				if err := createTree(out, dst, created); err != nil {
+				if err := createTree(out, dst, created, ""); err != nil {
 					return md5buf, 0, err
 				}
-				size, err := copyToTarAndDigest(out, &md5buf, src, dst)
+				size, err := copyToTarAndDigest(out, &md5buf, src, dst, user)
 				if err != nil {
 					return md5buf, 0, err
 				}
@@ -157,14 +161,14 @@ func createEmptyFoldersInsideTarGz(info *nfpm.Info, out *tar.Writer, created map
 		// this .nope is actually not created, because createTree ignore the
 		// last part of the path, assuming it is a file.
 		// TODO: should probably refactor this
-		if err := createTree(out, filepath.Join(folder, ".nope"), created); err != nil {
+		if err := createTree(out, filepath.Join(folder, ".nope"), created, info.User); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func copyToTarAndDigest(tarw *tar.Writer, md5w io.Writer, src, dst string) (int64, error) {
+func copyToTarAndDigest(tarw *tar.Writer, md5w io.Writer, src, dst, user string) (int64, error) {
 	file, err := os.OpenFile(src, os.O_RDONLY, 0600) //nolint:gosec
 	if err != nil {
 		return 0, errors.Wrap(err, "could not add file to the archive")
@@ -185,6 +189,8 @@ func copyToTarAndDigest(tarw *tar.Writer, md5w io.Writer, src, dst string) (int6
 		Mode:    int64(info.Mode()),
 		ModTime: time.Now(),
 		Format:  tar.FormatGNU,
+		Uname:   user,
+		Gname:   user,
 	}
 	if err := tarw.WriteHeader(&header); err != nil {
 		return 0, errors.Wrapf(err, "cannot write header of %s to data.tar.gz", src)
@@ -226,18 +232,8 @@ func createControl(instSize int64, md5sums []byte, info *nfpm.Info) (controlTarG
 		}
 	}
 
-	for script, dest := range map[string]string{
-		info.Scripts.PreInstall:             "preinst",
-		info.Scripts.PostInstall:            "postinst",
-		info.Scripts.PreRemove:              "prerm",
-		info.Scripts.PostRemove:             "postrm",
-		info.Overridables.Deb.Scripts.Rules: "rules",
-	} {
-		if script != "" {
-			if err := newScriptInsideTarGz(out, script, dest); err != nil {
-				return nil, err
-			}
-		}
+	if err := addControlScripts(out, info); err != nil {
+		return nil, errors.Wrap(err, "adding control scripts")
 	}
 
 	if err := out.Close(); err != nil {
@@ -247,6 +243,42 @@ func createControl(instSize int64, md5sums []byte, info *nfpm.Info) (controlTarG
 		return nil, errors.Wrap(err, "closing control.tar.gz")
 	}
 	return buf.Bytes(), nil
+}
+
+func addControlScripts(out *tar.Writer, info *nfpm.Info) error {
+	scripts := make(map[string]*bytes.Buffer)
+	for _, dest := range []string{"preinst", "postinst", "prerm", "postrm", "rules"} {
+		scripts[dest] = new(bytes.Buffer)
+	}
+	if info.User != "" {
+		if err := addScriptFromString(scripts["preinst"], "#!/bin/sh\n\nset -e\n\n"); err != nil {
+			return err
+		}
+		if err := addScriptFromString(scripts["preinst"], strings.ReplaceAll(scriptCreateUser, "%{package_user}", info.User)); err != nil {
+			return err
+		}
+	}
+	for script, dest := range map[string]string{
+		info.Scripts.PreInstall:             "preinst",
+		info.Scripts.PostInstall:            "postinst",
+		info.Scripts.PreRemove:              "prerm",
+		info.Scripts.PostRemove:             "postrm",
+		info.Overridables.Deb.Scripts.Rules: "rules",
+	} {
+		if script != "" {
+			if err := addScriptFromFile(scripts[dest], script); err != nil {
+				return err
+			}
+		}
+	}
+	for dest, script := range scripts {
+		if script.Len() > 0 {
+			if err := newScriptInsideTarGz(out, script.Bytes(), dest); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func newItemInsideTarGz(out *tar.Writer, content []byte, header *tar.Header) error {
@@ -270,15 +302,40 @@ func newFileInsideTarGz(out *tar.Writer, name string, content []byte) error {
 	})
 }
 
-func newScriptInsideTarGz(out *tar.Writer, path, dest string) error {
+func addScriptFromString(dest *bytes.Buffer, script string) error { //nolint:interfacer
+	_, err := dest.WriteString(script)
+	if err != nil {
+		return err
+	}
+
+	_, err = dest.WriteString("\n")
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func addScriptFromFile(dest *bytes.Buffer, path string) error { //nolint:interfacer
 	file, err := os.Open(path) //nolint:gosec
 	if err != nil {
 		return err
 	}
+
 	content, err := ioutil.ReadAll(file)
 	if err != nil {
 		return err
 	}
+
+	_, err = dest.Write(content)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func newScriptInsideTarGz(out *tar.Writer, content []byte, dest string) error {
 	return newItemInsideTarGz(out, content, &tar.Header{
 		Name:     filepath.ToSlash(dest),
 		Size:     int64(len(content)),
@@ -291,7 +348,7 @@ func newScriptInsideTarGz(out *tar.Writer, path, dest string) error {
 
 // this is needed because the data.tar.gz file should have the empty folders
 // as well, so we walk through the dst and create all subfolders.
-func createTree(tarw *tar.Writer, dst string, created map[string]bool) error {
+func createTree(tarw *tar.Writer, dst string, created map[string]bool, user string) error {
 	for _, path := range pathsToCreate(dst) {
 		if created[path] {
 			// skipping dir that was previously created inside the archive
@@ -304,6 +361,8 @@ func createTree(tarw *tar.Writer, dst string, created map[string]bool) error {
 			Typeflag: tar.TypeDir,
 			Format:   tar.FormatGNU,
 			ModTime:  time.Now(),
+			Uname:    user,
+			Gname:    user,
 		}); err != nil {
 			return errors.Wrap(err, "failed to create folder")
 		}

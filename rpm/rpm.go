@@ -72,6 +72,10 @@ func (*RPM) Package(info *nfpm.Info, w io.Writer) error {
 		return err
 	}
 
+	if err = addUser(info, rpm); err != nil {
+		return err
+	}
+
 	if err = rpm.Write(w); err != nil {
 		return err
 	}
@@ -187,6 +191,13 @@ func addScriptFiles(info *nfpm.Info, rpm *rpmpack.RPM) error {
 	return nil
 }
 
+func addUser(info *nfpm.Info, rpm *rpmpack.RPM) error {
+	if info.User != "" {
+		rpm.AddPrein(strings.ReplaceAll(scriptCreateUser, "%{package_user}", info.User))
+	}
+	return nil
+}
+
 func addEmptyDirsRPM(info *nfpm.Info, rpm *rpmpack.RPM) {
 	for _, dir := range info.EmptyFolders {
 		rpm.AddFile(
@@ -194,6 +205,8 @@ func addEmptyDirsRPM(info *nfpm.Info, rpm *rpmpack.RPM) {
 				Name:  dir,
 				Mode:  uint(040755),
 				MTime: uint32(time.Now().Unix()),
+				Owner: info.User,
+				Group: info.User,
 			},
 		)
 	}
@@ -201,7 +214,11 @@ func addEmptyDirsRPM(info *nfpm.Info, rpm *rpmpack.RPM) {
 
 func createFilesInsideRPM(info *nfpm.Info, rpm *rpmpack.RPM) error {
 	copyFunc := func(files map[string]string, config bool) error {
-		for srcglob, dstroot := range files {
+		for srcglob, dstraw := range files {
+			dstroot, user, _ := nfpm.GetFilesAttr(dstraw)
+			if user == "" {
+				user = info.User
+			}
 			globbed, err := glob.Glob(srcglob, dstroot)
 			if err != nil {
 				return err
@@ -214,7 +231,7 @@ func createFilesInsideRPM(info *nfpm.Info, rpm *rpmpack.RPM) error {
 					fmt.Printf("skipping %s because it has the suffix %s", src, info.Target)
 					continue
 				}
-				err := copyToRPM(rpm, src, dst, config)
+				err := copyToRPM(rpm, src, dst, config, user)
 				if err != nil {
 					return err
 				}
@@ -234,7 +251,7 @@ func createFilesInsideRPM(info *nfpm.Info, rpm *rpmpack.RPM) error {
 	return nil
 }
 
-func copyToRPM(rpm *rpmpack.RPM, src, dst string, config bool) error {
+func copyToRPM(rpm *rpmpack.RPM, src, dst string, config bool, user string) error {
 	file, err := os.OpenFile(src, os.O_RDONLY, 0600) //nolint:gosec
 	if err != nil {
 		return errors.Wrap(err, "could not add file to the archive")
@@ -259,6 +276,8 @@ func copyToRPM(rpm *rpmpack.RPM, src, dst string, config bool) error {
 		Body:  data,
 		Mode:  uint(info.Mode()),
 		MTime: uint32(info.ModTime().Unix()),
+		Owner: user,
+		Group: user,
 	}
 
 	if config {

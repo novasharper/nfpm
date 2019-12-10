@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/Masterminds/semver/v3"
@@ -130,6 +131,7 @@ type Overridables struct {
 	Recommends   []string          `yaml:"recommends,omitempty"`
 	Suggests     []string          `yaml:"suggests,omitempty"`
 	Conflicts    []string          `yaml:"conflicts,omitempty"`
+	User         string            `yaml:"user,omitempty"`
 	Files        map[string]string `yaml:"files,omitempty"`
 	ConfigFiles  map[string]string `yaml:"config_files,omitempty"`
 	EmptyFolders []string          `yaml:"empty_folders,omitempty"`
@@ -203,4 +205,11 @@ func WithDefaults(info *Info) *Info {
 		info.Deb.VersionMetadata = v.Metadata()
 	}
 	return info
+}
+
+// GetFilesAttr splits a file entry into the corresponding filename, user, and mode
+func GetFilesAttr(raw string) (name, user, mode string) {
+	// pad end to ensure that we have >= 3 elements in slice
+	parts := append(strings.SplitN(raw, ":", 3), "", "")
+	return parts[0], parts[1], parts[2]
 }
